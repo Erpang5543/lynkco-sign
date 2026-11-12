@@ -496,12 +496,20 @@ async function doSign(account) {
   }
 
   const msg = json
-    ? errorMessage(json)
-    : "HTTP " + res.status + " " + String(res.body || "").slice(0, 40);
+    ? "code=" + json.code + " " + errorMessage(json)
+    : "HTTP " + res.status + " " + String(res.body || "").slice(0, 60);
   if (/已签到|已经签到|重复|已签/.test(msg)) {
     return { ok: true, already: true, text: "今日已签到" };
   }
-  return { ok: false, text: msg + " (" + usedPath + ")" };
+  // 附加诊断: 用同一个 token 请求 day/info, 区分"token 无效"与"参数不对"
+  let probeInfo = "";
+  try {
+    const p = await callApiRaw("GET", "/up/api/v1/user/sign/day/info", account.at);
+    probeInfo = " | day/info " + p.status + " " + String(p.body || "").slice(0, 46);
+  } catch (e) {
+    probeInfo = " | day/info ERR";
+  }
+  return { ok: false, text: msg + probeInfo + " (" + usedPath + ")" };
 }
 
 /* accessToken 是否还能直接用 (减少刷新次数, 避免频繁轮换 refreshToken) */
