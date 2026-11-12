@@ -38,8 +38,12 @@ const APP_VERSION = "4.2.0";
 const APP_BUILD = "40200106";
 
 const EP_SIGN = "/up/api/v1/user/sign";
+const EP_SIGN_ALT = "/up/api/v1/user/sign/sign/Info"; // 新版 App 实际路径
 const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
 const EP_ENERGY = "/app/energy/myEnergy";
+
+// 从录制快照学到的真实签到路径(优先级最高)
+const SIGN_PATH_STORE = "lynkco_sign_path";
 
 const ACCOUNT_KEY = "lynkco_accounts";
 
@@ -301,7 +305,7 @@ function buildSignHeaders(method, path, query) {
     "X-Ca-Nonce": nonce,
     "X-Ca-Signature-Method": "HmacSHA256",
     "X-Ca-Timestamp": timestamp,
-    "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
+    "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp",
     "X-Ca-Signature": signature,
     "Accept": "*/*"
   };
@@ -323,6 +327,59 @@ function callApi(method, path, accessToken, query, payload) {
 
   const body = method === "POST" ? JSON.stringify(payload || {}) : undefined;
   return httpRequest(method, url, headers, body);
+}
+
+/* 按完整路径(可含 query)调用; 路径整体参与签名 */
+function callApiRaw(method, fullPath, accessToken, payload) {
+  const timestamp = String(Date.now());
+  const nonce = uuidUpper();
+  const parts = [
+    String(method).toUpperCase(),
+    "*/*",
+    "",
+    "application/json",
+    "",
+    "X-Ca-Key:" + caKey,
+    "X-Ca-Nonce:" + nonce,
+    "X-Ca-Signature-Method:HmacSHA256",
+    "X-Ca-Timestamp:" + timestamp,
+    fullPath
+  ];
+  const signature = base64(hmacSha256(CA_SECRET, parts.join("\n")));
+
+  const headers = {
+    "X-Ca-Key": caKey,
+    "X-Ca-Nonce": nonce,
+    "X-Ca-Signature-Method": "HmacSHA256",
+    "X-Ca-Timestamp": timestamp,
+    "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp",
+    "X-Ca-Signature": signature,
+    "token": accessToken,
+    "content-type": "application/json",
+    "Accept": "*/*"
+  };
+
+  const body = String(method).toUpperCase() === "POST" ? JSON.stringify(payload || {}) : undefined;
+  return httpRequest(method, API_HOST + fullPath, headers, body);
+}
+
+/* 从录制快照中学习真实的签到路径 (App 可能使用与旧版不同的路径) */
+function learnSignPath() {
+  const probe = safeJson(readStore("lynkco_sign_probe") || "null");
+  if (!probe || !probe.headers) return "";
+  if (String(probe.method || "").toUpperCase() !== "POST") return "";
+
+  let sig = "";
+  for (const k in probe.headers) {
+    if (k.toLowerCase() === "x-ca-signature") sig = probe.headers[k];
+  }
+  if (!sig) return "";
+
+  const full = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
+  if (!/^\/up\/api\/v1\/user\/sign/.test(full)) return "";
+
+  writeStore(SIGN_PATH_STORE, full);
+  return full;
 }
 
 /* ==================== 业务逻辑 ==================== */
@@ -407,9 +464,28 @@ async function queryEnergy(account) {
 
 /* 执行签到 */
 async function doSign(account) {
-  const res = await callApi("POST", EP_SIGN, account.at, null, {});
-  const json = res.json;
+  // 路径候选: 录制学到的 > 新版路径 > 旧版路径
+  const learned = readStore(SIGN_PATH_STORE) || "";
+  const candidates = [];
+  if (learned) candidates.push(learned);
+  if (candidates.indexOf(EP_SIGN_ALT) < 0) candidates.push(EP_SIGN_ALT);
+  if (candidates.indexOf(EP_SIGN) < 0) candidates.push(EP_SIGN);
 
+  let res = null;
+  let usedPath = "";
+  for (let i = 0; i < candidates.length; i++) {
+    const r = await callApiRaw("POST", candidates[i], account.at, {});
+    usedPath = candidates[i];
+    // 403 = 该 API 未对当前 consumer 授权, 换下一个路径继续试
+    if (r.status === 403) continue;
+    res = r;
+    break;
+  }
+  if (!res) {
+    return { ok: false, text: "所有签到路径均返回 403 (未授权)" };
+  }
+
+  const json = res.json;
   if (isOk(json)) {
     const d = json.data || {};
     const reward = [];
@@ -425,7 +501,7 @@ async function doSign(account) {
   if (/已签到|已经签到|重复|已签/.test(msg)) {
     return { ok: true, already: true, text: "今日已签到" };
   }
-  return { ok: false, text: msg };
+  return { ok: false, text: msg + " (" + usedPath + ")" };
 }
 
 /* accessToken 是否还能直接用 (减少刷新次数, 避免频繁轮换 refreshToken) */
@@ -534,10 +610,10 @@ function diagSignature() {
   writeStore("lynkco_diag_at", String(probe.at));
 
   if (hit) {
-    notify("签名诊断: 旧 secret 有效", "命中变体 " + hit,
-      "说明密钥没换, 问题在发送方式. " + method + " " + path);
+    notify("签名诊断: 旧 secret 有效", "命中 " + hit + " | " + method + " " + path.slice(0, 46),
+      "已学习签到路径: " + path.slice(0, 60));
   } else {
-    notify("签名诊断: 旧 secret 已失效", "重算结果与 App 不一致",
+    notify("签名诊断: 旧 secret 已失效", method + " " + path.slice(0, 46),
       "key=" + key + " 头数=" + Object.keys(H).length + " App签名=" + String(realSig).slice(0, 10) + "…");
   }
 
@@ -553,6 +629,9 @@ function diagSignature() {
 
   // 有录制快照时, 先做一次签名有效性诊断
   try { diagSignature(); } catch (e) { console.log("[领克] 诊断失败: " + e); }
+
+  // 从录制快照学习真实签到路径 (每次运行都刷新)
+  try { learnSignPath(); } catch (e) { console.log("[领克] 学习路径失败: " + e); }
 
   const list = safeJson(readStore(ACCOUNT_KEY) || "[]");
 
