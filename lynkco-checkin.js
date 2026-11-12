@@ -42,8 +42,9 @@ const EP_SIGN_ALT = "/up/api/v1/user/sign/sign/Info"; // 新版 App 实际路径
 const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
 const EP_ENERGY = "/app/energy/myEnergy";
 
-// 从录制快照学到的真实签到路径(优先级最高)
+// 从录制快照学到的真实签到路径/请求体(优先级最高)
 const SIGN_PATH_STORE = "lynkco_sign_path";
+const SIGN_BODY_STORE = "lynkco_sign_body";
 
 const ACCOUNT_KEY = "lynkco_accounts";
 
@@ -330,7 +331,7 @@ function callApi(method, path, accessToken, query, payload) {
 }
 
 /* 按完整路径(可含 query)调用; 路径整体参与签名 */
-function callApiRaw(method, fullPath, accessToken, payload) {
+function callApiRaw(method, fullPath, accessToken, payload, rawBody) {
   const timestamp = String(Date.now());
   const nonce = uuidUpper();
   const parts = [
@@ -359,7 +360,10 @@ function callApiRaw(method, fullPath, accessToken, payload) {
     "Accept": "*/*"
   };
 
-  const body = String(method).toUpperCase() === "POST" ? JSON.stringify(payload || {}) : undefined;
+  let body;
+  if (String(method).toUpperCase() === "POST") {
+    body = (typeof rawBody === "string" && rawBody.length) ? rawBody : JSON.stringify(payload || {});
+  }
   return httpRequest(method, API_HOST + fullPath, headers, body);
 }
 
@@ -380,6 +384,19 @@ function learnSignPath() {
 
   writeStore(SIGN_PATH_STORE, full);
   return full;
+}
+
+/* 从录制快照中学习真实的签到请求体 */
+function learnSignBody() {
+  const probe = safeJson(readStore("lynkco_sign_probe") || "null");
+  if (!probe || !probe.body) return "";
+  if (String(probe.method || "").toUpperCase() !== "POST") return "";
+  const full = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
+  if (!/^\/up\/api\/v1\/user\/sign/.test(full)) return "";
+  const bodyText = String(probe.body);
+  if (!bodyText.length) return "";
+  writeStore(SIGN_BODY_STORE, bodyText);
+  return bodyText;
 }
 
 /* ==================== 业务逻辑 ==================== */
@@ -466,6 +483,7 @@ async function queryEnergy(account) {
 async function doSign(account) {
   // 路径候选: 录制学到的 > 新版路径 > 旧版路径
   const learned = readStore(SIGN_PATH_STORE) || "";
+  const learnedBody = readStore(SIGN_BODY_STORE) || "";
   const candidates = [];
   if (learned) candidates.push(learned);
   if (candidates.indexOf(EP_SIGN_ALT) < 0) candidates.push(EP_SIGN_ALT);
@@ -474,7 +492,7 @@ async function doSign(account) {
   let res = null;
   let usedPath = "";
   for (let i = 0; i < candidates.length; i++) {
-    const r = await callApiRaw("POST", candidates[i], account.at, {});
+    const r = await callApiRaw("POST", candidates[i], account.at, {}, learnedBody);
     usedPath = candidates[i];
     // 403 = 该 API 未对当前 consumer 授权, 换下一个路径继续试
     if (r.status === 403) continue;
@@ -638,8 +656,9 @@ function diagSignature() {
   // 有录制快照时, 先做一次签名有效性诊断
   try { diagSignature(); } catch (e) { console.log("[领克] 诊断失败: " + e); }
 
-  // 从录制快照学习真实签到路径 (每次运行都刷新)
+  // 从录制快照学习真实签到路径 + 请求体 (每次运行都刷新)
   try { learnSignPath(); } catch (e) { console.log("[领克] 学习路径失败: " + e); }
+  try { learnSignBody(); } catch (e) { console.log("[领克] 学习请求体失败: " + e); }
 
   const list = safeJson(readStore(ACCOUNT_KEY) || "[]");
 
