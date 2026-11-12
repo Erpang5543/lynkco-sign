@@ -188,12 +188,14 @@ function finish() {
             url: url,
             method: request.method || "POST",
             headers: headers,
+            body: typeof request.body !== "undefined" ? request.body : "",
             at: Date.now()
           }));
+          const bodyText = typeof request.body !== "undefined" && request.body ? String(request.body) : "";
           notify(
             "已录制签到请求",
             (request.method || "POST") + " " + url.replace(/^https?:\/\/[^/]+/, ""),
-            "共 " + names.length + " 个头: " + names.join(", ").slice(0, 160)
+            bodyText ? ("body: " + bodyText.slice(0, 110)) : ("无 body | 头 " + names.length + " 个")
           );
         } catch (e) {
           console.log("[领克] 录制失败: " + e);
