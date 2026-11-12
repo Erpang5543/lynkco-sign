@@ -641,10 +641,14 @@ async function doSign(account) {
   // 3) 全都失败: 查签到状态, 区分 "已签过" 与 "真的失败"
   const day = await probeDayInfo(account);
   if (day && day.signed) {
+    // 顺手把接口的真实回包带上: 能看出是"重复签到"还是"签名被拒"
+    const echo = tried.length
+      ? " | 接口 " + (tried[0].mode === "replay" ? "重放 " : "") + tried[0].text.slice(0, 44)
+      : "";
     return {
       ok: true,
       already: true,
-      text: "今日已签到 (day/info 显示已签)"
+      text: "今日已签到 (day/info 显示已签)" + echo
     };
   }
 
