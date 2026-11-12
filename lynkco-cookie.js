@@ -31,6 +31,7 @@
 
 const ACCOUNT_KEY = "lynkco_accounts";
 const CA_KEY_STORE = "lynkco_ca_key"; // 网关消费者密钥, 由 App 请求头自动抓取
+const PROBE_KEY = "lynkco_sign_probe"; // 录制的签到请求快照, 供签到脚本重放
 const NOTIFY_KEY = "lynkco_cookie_notify_at";
 const NOTIFY_GAP = 60 * 1000; // 60 秒内不重复弹通知
 
@@ -175,6 +176,27 @@ function finish() {
         writeStore(CA_KEY_STORE, caKey);
         if (caKey !== known) {
           notify("领克网关密钥已更新", "X-Ca-Key = " + caKey, "已自动记录, 签到脚本会使用新值");
+        }
+      }
+
+      // 5. 录制签到请求: 保存 App 真实请求头, 供签到脚本原样重放
+      if (/\/user\/sign/i.test(url)) {
+        try {
+          const names = [];
+          for (const k in headers) names.push(k);
+          writeStore(PROBE_KEY, JSON.stringify({
+            url: url,
+            method: request.method || "POST",
+            headers: headers,
+            at: Date.now()
+          }));
+          notify(
+            "已录制签到请求",
+            (request.method || "POST") + " " + url.replace(/^https?:\/\/[^/]+/, ""),
+            "共 " + names.length + " 个头: " + names.join(", ").slice(0, 160)
+          );
+        } catch (e) {
+          console.log("[领克] 录制失败: " + e);
         }
       }
     }
