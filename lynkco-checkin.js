@@ -94,8 +94,33 @@ function httpRequest(method, url, headers, body) {
       });
     };
 
-    if (method === "POST") $httpClient.post(options, handler);
-    else $httpClient.get(options, handler);
+    // 1. 常规环境 (Loon / QX / Surge 的定时任务都提供)
+    if (typeof $httpClient !== "undefined" && $httpClient && typeof $httpClient.get === "function") {
+      if (method === "POST") $httpClient.post(options, handler);
+      else $httpClient.get(options, handler);
+      return;
+    }
+
+    // 2. Quantumult X 的 Promise 风格接口兜底
+    if (typeof $task !== "undefined" && typeof $task.fetch === "function") {
+      const opts = { url: url, method: method, headers: headers || {} };
+      if (body !== undefined && body !== null) opts.body = body;
+      $task.fetch(opts)
+        .then(function (resp) {
+          resolve({
+            status: resp.statusCode || resp.status || 0,
+            body: resp.body || "",
+            json: safeJson(resp.body || "")
+          });
+        })
+        .catch(function (err) {
+          reject(new Error(String(err && err.error ? err.error : err)));
+        });
+      return;
+    }
+
+    // 3. 都没有: 说明脚本被放进了重写上下文(同步执行, 不允许发网络请求)
+    reject(new Error("$httpClient 不可用, 请把本脚本加到【定时任务】, 不要加到【重写】"));
   });
 }
 
