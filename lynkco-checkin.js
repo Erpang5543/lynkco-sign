@@ -478,12 +478,81 @@ async function runAccount(account, index) {
   }
 }
 
+/* ==================== 签名诊断 ====================
+ * 用 cookie 脚本录制的 App 真实请求, 反推: 旧 secret 是否仍然有效。
+ * 判定方式: 用旧 secret 按标准签名串重算, 与 App 的 X-Ca-Signature 逐字符比对。
+ */
+function diagSignature() {
+  const probe = safeJson(readStore("lynkco_sign_probe") || "null");
+  if (!probe || !probe.headers) return null;
+  if (readStore("lynkco_diag_at") === String(probe.at)) return null; // 同一份快照只诊断一次
+
+  const H = probe.headers;
+  function g(name) {
+    const t = String(name).toLowerCase();
+    for (const k in H) if (k.toLowerCase() === t) return H[k];
+    return "";
+  }
+
+  const realSig = g("X-Ca-Signature");
+  const method = String(probe.method || "GET").toUpperCase();
+  const path = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
+  const key = g("X-Ca-Key");
+  const nonce = g("X-Ca-Nonce");
+  const ts = g("X-Ca-Timestamp");
+  const ctype = g("Content-Type");
+
+  if (!realSig) {
+    notify("签名诊断", "录制的请求里没有 X-Ca-Signature", method + " " + path);
+    writeStore("lynkco_diag_at", String(probe.at));
+    return null;
+  }
+
+  const caHeaders = function (c) {
+    return [
+      "X-Ca-Key:" + key,
+      "X-Ca-Nonce:" + nonce,
+      "X-Ca-Signature-Method:HmacSHA256",
+      "X-Ca-Timestamp:" + ts
+    ];
+  };
+
+  const variants = [
+    ["标准GET", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [path])],
+    ["ctype实际", [method, "*/*", "", ctype, ""].concat(caHeaders(), [path])],
+    ["ctype空", [method, "*/*", "", "", ""].concat(caHeaders(), [path])],
+    ["无path", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [""])],
+    ["标准+query", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [path])]
+  ];
+
+  let hit = "";
+  for (let i = 0; i < variants.length; i++) {
+    const sig = base64(hmacSha256(CA_SECRET, variants[i][1].join("\n")));
+    if (sig === realSig) { hit = variants[i][0]; break; }
+  }
+
+  writeStore("lynkco_diag_at", String(probe.at));
+
+  if (hit) {
+    notify("签名诊断: 旧 secret 有效", "命中变体 " + hit,
+      "说明密钥没换, 问题在发送方式. " + method + " " + path);
+  } else {
+    notify("签名诊断: 旧 secret 已失效", "重算结果与 App 不一致",
+      "key=" + key + " 头数=" + Object.keys(H).length + " App签名=" + String(realSig).slice(0, 10) + "…");
+  }
+
+  return { hit: hit, method: method, path: path, key: key, headers: Object.keys(H) };
+}
+
 /* ==================== 入口 ==================== */
 
 (async function main() {
   // 优先使用 cookie 脚本抓到的最新网关密钥
   const storedCaKey = readStore(CA_KEY_STORE);
   if (storedCaKey) caKey = storedCaKey;
+
+  // 有录制快照时, 先做一次签名有效性诊断
+  try { diagSignature(); } catch (e) { console.log("[领克] 诊断失败: " + e); }
 
   const list = safeJson(readStore(ACCOUNT_KEY) || "[]");
 
