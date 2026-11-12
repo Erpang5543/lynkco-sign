@@ -31,7 +31,8 @@
 
 const ACCOUNT_KEY = "lynkco_accounts";
 const CA_KEY_STORE = "lynkco_ca_key"; // 网关消费者密钥, 由 App 请求头自动抓取
-const PROBE_KEY = "lynkco_sign_probe"; // 录制的签到请求快照, 供签到脚本重放
+const PROBE_KEY = "lynkco_sign_probe"; // 真正的签到写请求, 供签到脚本重放
+const PROBE_INFO_KEY = "lynkco_sign_probe_info"; // 查询类请求(sign/info 等), 只做参考
 const NOTIFY_KEY = "lynkco_cookie_notify_at";
 const NOTIFY_GAP = 60 * 1000; // 60 秒内不重复弹通知
 
@@ -180,26 +181,39 @@ function finish() {
       }
 
       // 5. 录制签到请求: 只保留带 X-Ca-Signature 的真实请求, 避免被 OPTIONS 预检覆盖
+      //    注意: 查询类接口(sign/info 等)也用 POST, 会覆盖真正的签到快照, 必须分开存
       if (/\/user\/sign/i.test(url) && getHeader(headers, "X-Ca-Signature")) {
         try {
           const names = [];
           for (const k in headers) names.push(k);
-          writeStore(PROBE_KEY, JSON.stringify({
+
+          const isSignWrite =
+            /\/sign\/upgrade\/secured/i.test(url) || /\/user\/sign(\?|#|$)/i.test(url);
+          const snapshot = JSON.stringify({
             url: url,
             method: request.method || "POST",
             headers: headers,
             body: typeof request.body !== "undefined" ? request.body : "",
             at: Date.now()
-          }));
-          const bodyText = typeof request.body !== "undefined" && request.body ? String(request.body) : "";
-          const sigSpec = getHeader(headers, "X-Ca-Signature-Headers") || "-";
-          notify(
-            "已录制签到请求",
-            (request.method || "POST") + " " + url.replace(/^https?:\/\/[^/]+/, ""),
-            "头 " + names.length + " 个 | body " +
-              (bodyText ? " " + bodyText.length + " 字节: " + bodyText.slice(0, 70) : " 空") +
-              "\n签名头: " + sigSpec.replace(/x-ca-/gi, "")
-          );
+          });
+
+          writeStore(isSignWrite ? PROBE_KEY : PROBE_INFO_KEY, snapshot);
+
+          // 只有真正的签到动作才弹通知, 查询接口静默
+          if (isSignWrite) {
+            const bodyText = typeof request.body !== "undefined" && request.body ? String(request.body) : "";
+            const sigSpec = getHeader(headers, "X-Ca-Signature-Headers") || "-";
+            const stage = getHeader(headers, "X-Ca-Stage") || "-";
+            notify(
+              "已录制签到请求",
+              (request.method || "POST") + " " + url.replace(/^https?:\/\/[^/]+/, ""),
+              "头 " + names.length + " 个 | body " +
+                (bodyText ? " " + bodyText.length + " 字节: " + bodyText.slice(0, 60) : " 空") +
+                "\nStage: " + stage + " | 签名头: " + sigSpec.replace(/x-ca-/gi, "")
+            );
+          } else {
+            console.log("[领克] 已录制查询请求(不覆盖签到快照): " + url);
+          }
         } catch (e) {
           console.log("[领克] 录制失败: " + e);
         }

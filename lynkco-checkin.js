@@ -409,17 +409,18 @@ function isSignProbe(probe) {
 }
 
 /* 用快照构造一份可直接发送的请求 */
-function buildReplay(probe, account) {
+function buildReplay(probe, account, keyOverride) {
   const base = probe.headers || {};
   const path = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
   const method = String(probe.method || "POST").toUpperCase();
+  const useKey = keyOverride || caKey;
 
   const headers = {};
   for (const k in base) {
     if (HOP_HEADERS.indexOf(k.toLowerCase()) < 0) headers[k] = base[k];
   }
 
-  hSet(headers, "X-Ca-Key", caKey);
+  hSet(headers, "X-Ca-Key", useKey);
   hSet(headers, "X-Ca-Nonce", uuidUpper());
   hSet(headers, "X-Ca-Signature-Method", "HmacSHA256");
   hSet(headers, "X-Ca-Timestamp", String(Date.now()));
@@ -602,32 +603,58 @@ async function queryEnergy(account) {
   }
 }
 
+/* 临时切换网关 key 执行一次请求 (callApiRaw 同步构造 headers, 所以恢复是安全的) */
+function withKey(key, fn) {
+  const prev = caKey;
+  caKey = key;
+  try {
+    return fn();
+  } finally {
+    caKey = prev;
+  }
+}
+
+/* 网关 key 候选: 内置 key 最可能有权限, 其次抓到的 key, 最后快照里的 key */
+function keyCandidates(probe) {
+  const list = [DEFAULT_CA_KEY];
+  if (caKey && list.indexOf(caKey) < 0) list.push(caKey);
+  const pk = probe && probe.headers ? hGet(probe.headers, "X-Ca-Key") : "";
+  if (pk && list.indexOf(pk) < 0) list.push(pk);
+  return list;
+}
+
 /* 执行签到 */
 async function doSign(account) {
   const learned = readStore(SIGN_PATH_STORE) || "";
   const learnedBody = readStore(SIGN_BODY_STORE) || "";
   const probe = safeJson(readStore(PROBE_KEY) || "null");
+  const keys = keyCandidates(probe);
 
   const tried = [];
 
   // 1) 首选: 重放 App 的真实请求 (头最全, 签名最接近原样)
   if (isSignProbe(probe)) {
-    try {
-      const built = buildReplay(probe, account);
-      const res = await httpRequest(built.method, built.url, built.headers, built.body);
-      const r = judge(res, built.path);
-      console.log("[领克] 重放 " + built.path + " -> " + res.status + " " + String(res.body || "").slice(0, 90));
-      if (r.ok) return r;
-      tried.push({ path: built.path, mode: "replay", status: res.status, text: r.text });
-    } catch (e) {
-      console.log("[领克] 重放异常: " + e);
-      tried.push({ path: "replay", mode: "replay", status: 0, text: String(e && e.message ? e.message : e) });
+    for (let ki = 0; ki < keys.length; ki++) {
+      try {
+        const built = buildReplay(probe, account, keys[ki]);
+        const res = await httpRequest(built.method, built.url, built.headers, built.body);
+        const r = judge(res, built.path);
+        console.log("[领克] 重放 key=" + keys[ki] + " " + built.path + " -> " + res.status +
+          " " + String(res.body || "").slice(0, 80));
+        if (r.ok) return r;
+        tried.push({ path: built.path, mode: "replay", status: res.status, text: r.text });
+        if (res.status !== 403) break; // 403 才值得换 key 再试
+      } catch (e) {
+        console.log("[领克] 重放异常(key=" + keys[ki] + "): " + e);
+        tried.push({ path: "replay", mode: "replay", status: 0, text: String(e && e.message ? e.message : e) });
+        break;
+      }
     }
   } else {
     console.log("[领克] 无有效签到录制, 跳过重放");
   }
 
-  // 2) 兜底: 自建签名, 按候选路径依次尝试
+  // 2) 兜底: 自建签名, 按候选路径 + 候选 key 依次尝试
   //    注意排除 /sign/xxx/info 这类查询接口, 它们不是签到动作
   const candidates = [];
   if (learned && !/\/info|\/query|\/day\//i.test(learned)) candidates.push(learned);
@@ -636,12 +663,17 @@ async function doSign(account) {
   });
 
   for (let i = 0; i < candidates.length; i++) {
-    const res = await callApiRaw("POST", candidates[i], account.at, {}, learnedBody);
-    const r = judge(res, candidates[i]);
-    console.log("[领克] 自建 " + candidates[i] + " -> " + res.status + " " + String(res.body || "").slice(0, 90));
-    if (r.ok) return r;
-    tried.push({ path: candidates[i], mode: "self", status: res.status, text: r.text });
-    if (res.status === 403) continue; // 该接口未授权给当前 consumer, 换下一个
+    for (let ki = 0; ki < keys.length; ki++) {
+      const res = await withKey(keys[ki], function () {
+        return callApiRaw("POST", candidates[i], account.at, {}, learnedBody);
+      });
+      const r = judge(res, candidates[i]);
+      console.log("[领克] 自建 key=" + keys[ki] + " " + candidates[i] + " -> " + res.status +
+        " " + String(res.body || "").slice(0, 80));
+      if (r.ok) return r;
+      tried.push({ path: candidates[i], mode: "self", status: res.status, text: r.text });
+      if (res.status !== 403) break; // 403 = 该 consumer 无此接口权限, 换 key 再试
+    }
   }
 
   // 3) 全都失败: 查签到状态, 区分 "已签过" 与 "真的失败"
@@ -805,6 +837,13 @@ function diagSignature() {
     ? (String(dbgProbe.method || "?").toUpperCase() + " " + String(dbgProbe.url || "").replace(/^https?:\/\/[^/]+/, "") +
        " | 头 " + Object.keys(dbgProbe.headers || {}).length + " 个 | body " + (dbgProbe.body ? String(dbgProbe.body).length + " 字节" : "空"))
     : "无"));
+
+  if (dbgProbe && dbgProbe.headers) {
+    console.log("[领克] 快照头名: " + Object.keys(dbgProbe.headers).join(","));
+    console.log("[领克] 快照 key=" + (hGet(dbgProbe.headers, "X-Ca-Key") || "无") +
+      " stage=" + (hGet(dbgProbe.headers, "X-Ca-Stage") || "无") +
+      " 脚本 key=" + caKey);
+  }
 
   // 有录制快照时, 先做一次签名有效性诊断
   try { diagSignature(); } catch (e) { console.log("[领克] 诊断失败: " + e); }
