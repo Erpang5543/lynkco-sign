@@ -179,8 +179,8 @@ function finish() {
         }
       }
 
-      // 5. 录制签到请求: 保存 App 真实请求头, 供签到脚本原样重放
-      if (/\/user\/sign/i.test(url)) {
+      // 5. 录制签到请求: 只保留带 X-Ca-Signature 的真实请求, 避免被 OPTIONS 预检覆盖
+      if (/\/user\/sign/i.test(url) && getHeader(headers, "X-Ca-Signature")) {
         try {
           const names = [];
           for (const k in headers) names.push(k);
