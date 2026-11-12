@@ -33,6 +33,7 @@ const ACCOUNT_KEY = "lynkco_accounts";
 const CA_KEY_STORE = "lynkco_ca_key"; // 网关消费者密钥, 由 App 请求头自动抓取
 const PROBE_KEY = "lynkco_sign_probe"; // 真正的签到写请求, 供签到脚本重放
 const PROBE_INFO_KEY = "lynkco_sign_probe_info"; // 查询类请求(sign/info 等), 只做参考
+const HISTORY_KEY = "lynkco_sign_history"; // 最近的签到类请求快照(按路径去重), 防止被覆盖丢失
 const NOTIFY_KEY = "lynkco_cookie_notify_at";
 const NOTIFY_GAP = 60 * 1000; // 60 秒内不重复弹通知
 
@@ -198,6 +199,20 @@ function finish() {
           });
 
           writeStore(isSignWrite ? PROBE_KEY : PROBE_INFO_KEY, snapshot);
+
+          // 再留一份历史快照(按路径去重, 最多 6 条), 避免被后来的请求覆盖后彻底丢失
+          try {
+            const pathOnly = url.replace(/^https?:\/\/[^/]+/, "");
+            let hist = safeJson(readStore(HISTORY_KEY) || "[]");
+            if (!Array.isArray(hist)) hist = [];
+            hist = hist.filter(function (h) {
+              return String(h && h.url || "").replace(/^https?:\/\/[^/]+/, "") !== pathOnly;
+            });
+            hist.unshift(JSON.parse(snapshot));
+            writeStore(HISTORY_KEY, JSON.stringify(hist.slice(0, 6)));
+          } catch (e) {
+            console.log("[领克] 历史快照写入失败: " + e);
+          }
 
           // 只有真正的签到动作才弹通知, 查询接口静默
           if (isSignWrite) {

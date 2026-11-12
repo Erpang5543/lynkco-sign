@@ -34,6 +34,9 @@ const CA_KEY_STORE = "lynkco_ca_key";
 
 const CA_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 
+// App 原生消费者 key (与内置 key 属于不同 API 分组, 两者权限互补)
+const APP_CA_KEY = "203760416";
+
 const APP_VERSION = "4.2.0";
 const APP_BUILD = "40200106";
 
@@ -408,6 +411,20 @@ function isSignProbe(probe) {
   return String(probe.method || "POST").toUpperCase() === "POST";
 }
 
+/* 取签到快照: 优先主快照, 主快照不是签到动作时回退到历史快照 */
+function loadSignProbe() {
+  const cur = safeJson(readStore(PROBE_KEY) || "null");
+  if (isSignProbe(cur)) return cur;
+
+  const hist = safeJson(readStore(HISTORY_KEY) || "[]");
+  if (Array.isArray(hist)) {
+    for (let i = 0; i < hist.length; i++) {
+      if (isSignProbe(hist[i])) return hist[i];
+    }
+  }
+  return cur;
+}
+
 /* 用快照构造一份可直接发送的请求 */
 function buildReplay(probe, account, keyOverride) {
   const base = probe.headers || {};
@@ -501,7 +518,7 @@ async function probeDayInfo(account) {
 
 /* 从录制快照中学习真实的签到路径 (App 可能使用与旧版不同的路径) */
 function learnSignPath() {
-  const probe = safeJson(readStore(PROBE_KEY) || "null");
+  const probe = loadSignProbe();
   if (!isSignProbe(probe)) return "";
 
   const full = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
@@ -511,7 +528,7 @@ function learnSignPath() {
 
 /* 从录制快照中学习真实的签到请求体 */
 function learnSignBody() {
-  const probe = safeJson(readStore(PROBE_KEY) || "null");
+  const probe = loadSignProbe();
   if (!isSignProbe(probe) || !probe.body) return "";
   const bodyText = String(probe.body);
   if (!bodyText.length) return "";
@@ -614,9 +631,12 @@ function withKey(key, fn) {
   }
 }
 
-/* 网关 key 候选: 内置 key 最可能有权限, 其次抓到的 key, 最后快照里的 key */
+/* 网关 key 候选: 内置 key 最可能有权限, 其次 App 原生 key, 最后抓到的 key */
 function keyCandidates(probe) {
   const list = [DEFAULT_CA_KEY];
+  [APP_CA_KEY].forEach(function (k) {
+    if (k && list.indexOf(k) < 0) list.push(k);
+  });
   if (caKey && list.indexOf(caKey) < 0) list.push(caKey);
   const pk = probe && probe.headers ? hGet(probe.headers, "X-Ca-Key") : "";
   if (pk && list.indexOf(pk) < 0) list.push(pk);
@@ -627,7 +647,7 @@ function keyCandidates(probe) {
 async function doSign(account) {
   const learned = readStore(SIGN_PATH_STORE) || "";
   const learnedBody = readStore(SIGN_BODY_STORE) || "";
-  const probe = safeJson(readStore(PROBE_KEY) || "null");
+  const probe = loadSignProbe();
   const keys = keyCandidates(probe);
 
   const tried = [];
