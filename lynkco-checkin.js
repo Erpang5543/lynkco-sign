@@ -38,7 +38,9 @@ const APP_VERSION = "4.2.0";
 const APP_BUILD = "40200106";
 
 const EP_SIGN = "/up/api/v1/user/sign";
+const EP_SIGN_SECURED = "/up/api/v1/user/sign/upgrade/secured"; // 4.2.x 实际签到接口
 const EP_SIGN_ALT = "/up/api/v1/user/sign/sign/Info"; // 新版 App 实际路径
+const EP_SIGN_DAY = "/up/api/v1/user/sign/day/info"; // 今日签到状态, 用来判断"已签"
 const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
 const EP_ENERGY = "/app/energy/myEnergy";
 
@@ -367,32 +369,149 @@ function callApiRaw(method, fullPath, accessToken, payload, rawBody) {
   return httpRequest(method, API_HOST + fullPath, headers, body);
 }
 
+/* ==================== 录制重放 ====================
+ * App 的签到请求带 30+ 个业务头, 其中可能有参与网关签名的自定义头,
+ * 靠猜永远猜不全。这里直接重放录制的真实请求:
+ *   头全盘照抄 -> 只替换 token / gl_dev_id / X-Ca-Nonce / X-Ca-Timestamp
+ *   -> 按 App 自己声明的 X-Ca-Signature-Headers 顺序重算签名
+ */
+
+const PROBE_KEY = "lynkco_sign_probe";
+
+const HOP_HEADERS = [
+  "host", "connection", "content-length", "accept-encoding",
+  "proxy-connection", "te", "trailer", "upgrade",
+  "x-ca-signature", "x-ca-nonce", "x-ca-timestamp", "x-ca-key"
+];
+
+function hFind(headers, name) {
+  const t = String(name).toLowerCase();
+  for (const k in headers) if (k.toLowerCase() === t) return k;
+  return "";
+}
+
+function hGet(headers, name) {
+  const k = hFind(headers, name);
+  return k ? headers[k] : "";
+}
+
+function hSet(headers, name, value) {
+  headers[hFind(headers, name) || name] = value;
+}
+
+/* 快照是不是"签到"动作 (排除 day/info、sign/info 这类查询) */
+function isSignProbe(probe) {
+  if (!probe || !probe.url) return false;
+  const p = String(probe.url).replace(/^https?:\/\/[^/]+/, "");
+  if (!/\/user\/sign/i.test(p)) return false;
+  if (/\/info|\/query|\/list|\/config|\/record|\/day\//i.test(p)) return false;
+  return String(probe.method || "POST").toUpperCase() === "POST";
+}
+
+/* 用快照构造一份可直接发送的请求 */
+function buildReplay(probe, account) {
+  const base = probe.headers || {};
+  const path = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
+  const method = String(probe.method || "POST").toUpperCase();
+
+  const headers = {};
+  for (const k in base) {
+    if (HOP_HEADERS.indexOf(k.toLowerCase()) < 0) headers[k] = base[k];
+  }
+
+  hSet(headers, "X-Ca-Key", caKey);
+  hSet(headers, "X-Ca-Nonce", uuidUpper());
+  hSet(headers, "X-Ca-Signature-Method", "HmacSHA256");
+  hSet(headers, "X-Ca-Timestamp", String(Date.now()));
+
+  hSet(headers, "token", account.at);
+  if (hGet(headers, "gl_dev_id")) hSet(headers, "gl_dev_id", account.did);
+  if (hGet(headers, "deviceId")) hSet(headers, "deviceId", account.did);
+
+  // Date 头存在就必须刷新, 否则网关按时间偏差直接拒绝
+  let dateLine = "";
+  if (hGet(headers, "Date")) {
+    dateLine = new Date().toUTCString();
+    hSet(headers, "Date", dateLine);
+  }
+
+  const accept = hGet(headers, "Accept") || "*/*";
+  const md5 = hGet(headers, "Content-MD5") || "";
+  const ctype = hGet(headers, "Content-Type") || "application/json";
+
+  // 关键: 按 App 声明的签名头顺序拼签名串, 少一个都会 Invalid Signature
+  // (清单原文必须原样回传, 大小写变了服务端拼串就对不上)
+  const specRaw = hGet(headers, "X-Ca-Signature-Headers");
+  const names = (specRaw || "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp")
+    .split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  const custom = names.map(function (n) { return n + ":" + (hGet(headers, n) || ""); });
+
+  const parts = [method, accept, md5, ctype, dateLine].concat(custom, [path]);
+  hSet(headers, "X-Ca-Signature", base64(hmacSha256(CA_SECRET, parts.join("\n"))));
+  if (!specRaw) hSet(headers, "X-Ca-Signature-Headers", names.join(","));
+
+  const body = method === "POST" && typeof probe.body === "string" && probe.body.length
+    ? probe.body
+    : undefined;
+
+  return { method: method, path: path, url: API_HOST + path, headers: headers, body: body };
+}
+
+/* ==================== 结果判定 ==================== */
+
+function truthy(v) {
+  return v === true || v === 1 || v === "1" || v === "true" || v === "TRUE";
+}
+
+function judge(res, path) {
+  const json = res.json;
+  if (isOk(json)) {
+    const d = json.data || {};
+    const reward = [];
+    if (d.rewardEnergyNumber) reward.push("+" + d.rewardEnergyNumber + " 能量体");
+    if (d.rewardPointNumber) reward.push("+" + d.rewardPointNumber + " Co积分");
+    if (d.rewardSignCardNumber) reward.push("+" + d.rewardSignCardNumber + " 补签卡");
+    return { ok: true, text: reward.length ? reward.join(", ") : "签到成功", path: path };
+  }
+
+  const msg = json
+    ? "code=" + json.code + " " + errorMessage(json)
+    : "HTTP " + res.status + " " + String(res.body || "").slice(0, 60);
+  if (/已签到|已经签到|重复|已签/.test(msg)) {
+    return { ok: true, already: true, text: "今日已签到", path: path };
+  }
+  return { ok: false, text: msg, path: path, status: res.status, json: json };
+}
+
+/* 查今日签到状态: 接口返回 400 操作失败时多为"今天已签过", 用它确认 */
+async function probeDayInfo(account) {
+  try {
+    const p = await callApiRaw("GET", EP_SIGN_DAY, account.at);
+    const j = p.json || {};
+    const d = j.data || {};
+    const signed =
+      truthy(d.todayIsSign) || truthy(d.isSign) || truthy(d.todaySigned) ||
+      truthy(d.signStatus) || truthy(d.status);
+    return { status: p.status, body: String(p.body || ""), signed: signed, data: d };
+  } catch (e) {
+    return null;
+  }
+}
+
 /* 从录制快照中学习真实的签到路径 (App 可能使用与旧版不同的路径) */
 function learnSignPath() {
-  const probe = safeJson(readStore("lynkco_sign_probe") || "null");
-  if (!probe || !probe.headers) return "";
-  if (String(probe.method || "").toUpperCase() !== "POST") return "";
-
-  let sig = "";
-  for (const k in probe.headers) {
-    if (k.toLowerCase() === "x-ca-signature") sig = probe.headers[k];
-  }
-  if (!sig) return "";
+  const probe = safeJson(readStore(PROBE_KEY) || "null");
+  if (!isSignProbe(probe)) return "";
 
   const full = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
-  if (!/^\/up\/api\/v1\/user\/sign/.test(full)) return "";
-
   writeStore(SIGN_PATH_STORE, full);
   return full;
 }
 
 /* 从录制快照中学习真实的签到请求体 */
 function learnSignBody() {
-  const probe = safeJson(readStore("lynkco_sign_probe") || "null");
-  if (!probe || !probe.body) return "";
-  if (String(probe.method || "").toUpperCase() !== "POST") return "";
-  const full = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
-  if (!/^\/up\/api\/v1\/user\/sign/.test(full)) return "";
+  const probe = safeJson(readStore(PROBE_KEY) || "null");
+  if (!isSignProbe(probe) || !probe.body) return "";
   const bodyText = String(probe.body);
   if (!bodyText.length) return "";
   writeStore(SIGN_BODY_STORE, bodyText);
@@ -438,7 +557,11 @@ async function refreshToken(account) {
   const json = res.json;
 
   if (!isOk(json)) {
-    throw new Error("刷新登录态失败: " + errorMessage(json, "HTTP " + res.status));
+    const m = errorMessage(json, "HTTP " + res.status);
+    if (/invalid_expired|refresh.*(invalid|expired)/i.test(m)) {
+      throw new Error("登录态已失效, 请在领克 App 里退出重登再抓一次");
+    }
+    throw new Error("刷新登录态失败: " + m);
   }
 
   const dto = (json.data && json.data.centerTokenDto) || {};
@@ -481,53 +604,56 @@ async function queryEnergy(account) {
 
 /* 执行签到 */
 async function doSign(account) {
-  // 路径候选: 录制学到的 > 新版路径 > 旧版路径
   const learned = readStore(SIGN_PATH_STORE) || "";
   const learnedBody = readStore(SIGN_BODY_STORE) || "";
+  const probe = safeJson(readStore(PROBE_KEY) || "null");
+
+  const tried = [];
+
+  // 1) 首选: 重放 App 的真实请求 (头最全, 签名最接近原样)
+  if (isSignProbe(probe)) {
+    try {
+      const built = buildReplay(probe, account);
+      const res = await httpRequest(built.method, built.url, built.headers, built.body);
+      const r = judge(res, built.path);
+      if (r.ok) return r;
+      tried.push({ path: built.path, mode: "replay", status: res.status, text: r.text });
+    } catch (e) {
+      tried.push({ path: "replay", mode: "replay", status: 0, text: String(e && e.message ? e.message : e) });
+    }
+  }
+
+  // 2) 兜底: 自建签名, 按候选路径依次尝试
   const candidates = [];
   if (learned) candidates.push(learned);
-  if (candidates.indexOf(EP_SIGN_ALT) < 0) candidates.push(EP_SIGN_ALT);
-  if (candidates.indexOf(EP_SIGN) < 0) candidates.push(EP_SIGN);
+  [EP_SIGN_SECURED, EP_SIGN_ALT, EP_SIGN].forEach(function (p) {
+    if (candidates.indexOf(p) < 0) candidates.push(p);
+  });
 
-  let res = null;
-  let usedPath = "";
   for (let i = 0; i < candidates.length; i++) {
-    const r = await callApiRaw("POST", candidates[i], account.at, {}, learnedBody);
-    usedPath = candidates[i];
-    // 403 = 该 API 未对当前 consumer 授权, 换下一个路径继续试
-    if (r.status === 403) continue;
-    res = r;
-    break;
-  }
-  if (!res) {
-    return { ok: false, text: "所有签到路径均返回 403 (未授权)" };
+    const res = await callApiRaw("POST", candidates[i], account.at, {}, learnedBody);
+    const r = judge(res, candidates[i]);
+    if (r.ok) return r;
+    tried.push({ path: candidates[i], mode: "self", status: res.status, text: r.text });
+    if (res.status === 403) continue; // 该接口未授权给当前 consumer, 换下一个
   }
 
-  const json = res.json;
-  if (isOk(json)) {
-    const d = json.data || {};
-    const reward = [];
-    if (d.rewardEnergyNumber) reward.push("+" + d.rewardEnergyNumber + " 能量体");
-    if (d.rewardPointNumber) reward.push("+" + d.rewardPointNumber + " Co积分");
-    if (d.rewardSignCardNumber) reward.push("+" + d.rewardSignCardNumber + " 补签卡");
-    return { ok: true, text: reward.length ? reward.join(", ") : "签到成功" };
+  // 3) 全都失败: 查签到状态, 区分 "已签过" 与 "真的失败"
+  const day = await probeDayInfo(account);
+  if (day && day.signed) {
+    return {
+      ok: true,
+      already: true,
+      text: "今日已签到 (day/info 显示已签)"
+    };
   }
 
-  const msg = json
-    ? "code=" + json.code + " " + errorMessage(json)
-    : "HTTP " + res.status + " " + String(res.body || "").slice(0, 60);
-  if (/已签到|已经签到|重复|已签/.test(msg)) {
-    return { ok: true, already: true, text: "今日已签到" };
-  }
-  // 附加诊断: 用同一个 token 请求 day/info, 区分"token 无效"与"参数不对"
-  let probeInfo = "";
-  try {
-    const p = await callApiRaw("GET", "/up/api/v1/user/sign/day/info", account.at);
-    probeInfo = " | day/info " + p.status + " " + String(p.body || "").slice(0, 46);
-  } catch (e) {
-    probeInfo = " | day/info ERR";
-  }
-  return { ok: false, text: msg + probeInfo + " (" + usedPath + ")" };
+  const first = tried[0] || { text: "无可用路径", path: "-" };
+  const tail = day ? " | day/info " + day.status + " " + String(day.body).slice(0, 70) : " | day/info ERR";
+  return {
+    ok: false,
+    text: first.text + tail + " (" + first.path + (first.mode === "replay" ? " 重放" : "") + ")"
+  };
 }
 
 /* accessToken 是否还能直接用 (减少刷新次数, 避免频繁轮换 refreshToken) */
@@ -610,7 +736,7 @@ function diagSignature() {
     return null;
   }
 
-  const caHeaders = function (c) {
+  const caHeaders = function () {
     return [
       "X-Ca-Key:" + key,
       "X-Ca-Nonce:" + nonce,
@@ -619,12 +745,22 @@ function diagSignature() {
     ];
   };
 
+  // 第一优先: 完全按 App 自己声明的签名头清单重算 —— 命中就说明"重放"这套逻辑可用
+  const spec = g("X-Ca-Signature-Headers") ||
+    "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp";
+  const specNames = spec.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  const specLines = specNames.map(function (n) { return n + ":" + g(n); });
+
+  const acceptReal = g("Accept") || "*/*";
+  const md5Real = g("Content-MD5") || "";
+  const dateReal = g("Date") || "";
+
   const variants = [
+    ["App签名头", [method, acceptReal, md5Real, ctype || "application/json", dateReal].concat(specLines, [path])],
     ["标准GET", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [path])],
     ["ctype实际", [method, "*/*", "", ctype, ""].concat(caHeaders(), [path])],
     ["ctype空", [method, "*/*", "", "", ""].concat(caHeaders(), [path])],
-    ["无path", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [""])],
-    ["标准+query", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [path])]
+    ["无path", [method, "*/*", "", "application/json", ""].concat(caHeaders(), [""])]
   ];
 
   let hit = "";

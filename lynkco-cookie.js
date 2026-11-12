@@ -192,10 +192,13 @@ function finish() {
             at: Date.now()
           }));
           const bodyText = typeof request.body !== "undefined" && request.body ? String(request.body) : "";
+          const sigSpec = getHeader(headers, "X-Ca-Signature-Headers") || "-";
           notify(
             "已录制签到请求",
             (request.method || "POST") + " " + url.replace(/^https?:\/\/[^/]+/, ""),
-            bodyText ? ("body: " + bodyText.slice(0, 110)) : ("无 body | 头 " + names.length + " 个")
+            "头 " + names.length + " 个 | body " +
+              (bodyText ? " " + bodyText.length + " 字节: " + bodyText.slice(0, 70) : " 空") +
+              "\n签名头: " + sigSpec.replace(/x-ca-/gi, "")
           );
         } catch (e) {
           console.log("[领克] 录制失败: " + e);
