@@ -426,7 +426,7 @@ function loadSignProbe() {
 }
 
 /* 用快照构造一份可直接发送的请求 */
-function buildReplay(probe, account, keyOverride) {
+function buildReplay(probe, account, keyOverride, mode) {
   const base = probe.headers || {};
   const path = String(probe.url || "").replace(/^https?:\/\/[^/]+/, "");
   const method = String(probe.method || "POST").toUpperCase();
@@ -435,6 +435,26 @@ function buildReplay(probe, account, keyOverride) {
   const headers = {};
   for (const k in base) {
     if (HOP_HEADERS.indexOf(k.toLowerCase()) < 0) headers[k] = base[k];
+  }
+
+  // 模式 nosign: 去掉全部 X-Ca-* 签名头, 只靠 Cookie / token 认证
+  // (部分网关给 H5 开了 Cookie 鉴权, 有 Cookie 就不校验签名)
+  if (mode === "nosign") {
+    for (const k in headers) {
+      if (/^x-ca-/i.test(k)) delete headers[k];
+    }
+    hSet(headers, "token", account.at);
+    const body0 = method === "POST" && typeof probe.body === "string" && probe.body.length
+      ? probe.body : undefined;
+    return { method: method, path: path, url: API_HOST + path, headers: headers, body: body0 };
+  }
+
+  // 模式 rawsig: 原样使用 App 的 nonce/timestamp/signature (只在录制后 10 分钟内有效)
+  if (mode === "rawsig") {
+    hSet(headers, "token", account.at);
+    const body1 = method === "POST" && typeof probe.body === "string" && probe.body.length
+      ? probe.body : undefined;
+    return { method: method, path: path, url: API_HOST + path, headers: headers, body: body1 };
   }
 
   hSet(headers, "X-Ca-Key", useKey);
@@ -652,11 +672,26 @@ async function doSign(account) {
 
   const tried = [];
 
-  // 1) 首选: 重放 App 的真实请求 (头最全, 签名最接近原样)
+  // 1) 首选: 重放 App 的真实请求
+  //    rawsig = 连签名一起照抄(仅录制后 10 分钟内) / resign = 自算签名 / nosign = 不要签名
   if (isSignProbe(probe)) {
+    const fresh = probe.at && Date.now() - Number(probe.at) < 10 * 60 * 1000;
+    if (fresh) {
+      try {
+        const built = buildReplay(probe, account, "", "rawsig");
+        const res = await httpRequest(built.method, built.url, built.headers, built.body);
+        const r = judge(res, built.path);
+        console.log("[领克] 原样签名 " + built.path + " -> " + res.status + " " + String(res.body || "").slice(0, 80));
+        if (r.ok) return r;
+        tried.push({ path: built.path, mode: "replay", status: res.status, text: r.text });
+      } catch (e) {
+        console.log("[领克] 原样签名失败: " + e);
+      }
+    }
+
     for (let ki = 0; ki < keys.length; ki++) {
       try {
-        const built = buildReplay(probe, account, keys[ki]);
+        const built = buildReplay(probe, account, keys[ki], "resign");
         const res = await httpRequest(built.method, built.url, built.headers, built.body);
         const r = judge(res, built.path);
         console.log("[领克] 重放 key=" + keys[ki] + " " + built.path + " -> " + res.status +
@@ -669,6 +704,18 @@ async function doSign(account) {
         tried.push({ path: "replay", mode: "replay", status: 0, text: String(e && e.message ? e.message : e) });
         break;
       }
+    }
+
+    // 去掉签名, 只用 Cookie/token 试一次
+    try {
+      const built = buildReplay(probe, account, "", "nosign");
+      const res = await httpRequest(built.method, built.url, built.headers, built.body);
+      const r = judge(res, built.path);
+      console.log("[领克] 免签名 " + built.path + " -> " + res.status + " " + String(res.body || "").slice(0, 80));
+      if (r.ok) return r;
+      tried.push({ path: built.path, mode: "replay", status: res.status, text: r.text });
+    } catch (e) {
+      console.log("[领克] 免签名失败: " + e);
     }
   } else {
     console.log("[领克] 无有效签到录制, 跳过重放");
