@@ -25,7 +25,13 @@ const API_HOST = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_HOST = "https://app-services.lynkco.com.cn";
 
 const APP_CODE = "3fa3314998bd4195a9fe2df3e85e6a12";
-const CA_KEY = "204644386";
+
+// 网关消费者密钥: 内置值可能随 App 版本升级失效,
+// lynkco-cookie.js 抓到新值时会写入存储, 这里自动覆盖
+const DEFAULT_CA_KEY = "204644386";
+let caKey = DEFAULT_CA_KEY;
+const CA_KEY_STORE = "lynkco_ca_key";
+
 const CA_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 
 const APP_VERSION = "4.2.0";
@@ -281,7 +287,7 @@ function buildSignHeaders(method, path, query) {
     "",
     "application/json",
     "",
-    "X-Ca-Key:" + CA_KEY,
+    "X-Ca-Key:" + caKey,
     "X-Ca-Nonce:" + nonce,
     "X-Ca-Signature-Method:HmacSHA256",
     "X-Ca-Timestamp:" + timestamp,
@@ -291,7 +297,7 @@ function buildSignHeaders(method, path, query) {
   const signature = base64(hmacSha256(CA_SECRET, parts.join("\n")));
 
   return {
-    "X-Ca-Key": CA_KEY,
+    "X-Ca-Key": caKey,
     "X-Ca-Nonce": nonce,
     "X-Ca-Signature-Method": "HmacSHA256",
     "X-Ca-Timestamp": timestamp,
@@ -413,7 +419,9 @@ async function doSign(account) {
     return { ok: true, text: reward.length ? reward.join(", ") : "签到成功" };
   }
 
-  const msg = errorMessage(json);
+  const msg = json
+    ? errorMessage(json)
+    : "HTTP " + res.status + " " + String(res.body || "").slice(0, 40);
   if (/已签到|已经签到|重复|已签/.test(msg)) {
     return { ok: true, already: true, text: "今日已签到" };
   }
@@ -473,6 +481,10 @@ async function runAccount(account, index) {
 /* ==================== 入口 ==================== */
 
 (async function main() {
+  // 优先使用 cookie 脚本抓到的最新网关密钥
+  const storedCaKey = readStore(CA_KEY_STORE);
+  if (storedCaKey) caKey = storedCaKey;
+
   const list = safeJson(readStore(ACCOUNT_KEY) || "[]");
 
   if (!Array.isArray(list) || !list.length) {
