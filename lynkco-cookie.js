@@ -30,6 +30,7 @@
  ***************************************************************/
 
 const ACCOUNT_KEY = "lynkco_accounts";
+const CA_KEY_STORE = "lynkco_ca_key"; // 网关消费者密钥, 由 App 请求头自动抓取
 const NOTIFY_KEY = "lynkco_cookie_notify_at";
 const NOTIFY_GAP = 60 * 1000; // 60 秒内不重复弹通知
 
@@ -166,6 +167,16 @@ function finish() {
       const token = getHeader(headers, "token");
       const did = getHeader(headers, "gl_dev_id");
       if (token && did) patch = { did: did, at: token };
+
+      // 4. 顺手抓网关的消费者密钥: 若与内置值不同, 说明官方换了 X-Ca-Key
+      const caKey = getHeader(headers, "X-Ca-Key");
+      if (caKey) {
+        const known = readStore(CA_KEY_STORE);
+        writeStore(CA_KEY_STORE, caKey);
+        if (caKey !== known) {
+          notify("领克网关密钥已更新", "X-Ca-Key = " + caKey, "已自动记录, 签到脚本会使用新值");
+        }
+      }
     }
   } catch (e) {
     console.log("[领克] 解析失败: " + e);
