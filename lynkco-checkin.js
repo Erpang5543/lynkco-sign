@@ -616,23 +616,29 @@ async function doSign(account) {
       const built = buildReplay(probe, account);
       const res = await httpRequest(built.method, built.url, built.headers, built.body);
       const r = judge(res, built.path);
+      console.log("[领克] 重放 " + built.path + " -> " + res.status + " " + String(res.body || "").slice(0, 90));
       if (r.ok) return r;
       tried.push({ path: built.path, mode: "replay", status: res.status, text: r.text });
     } catch (e) {
+      console.log("[领克] 重放异常: " + e);
       tried.push({ path: "replay", mode: "replay", status: 0, text: String(e && e.message ? e.message : e) });
     }
+  } else {
+    console.log("[领克] 无有效签到录制, 跳过重放");
   }
 
   // 2) 兜底: 自建签名, 按候选路径依次尝试
+  //    注意排除 /sign/xxx/info 这类查询接口, 它们不是签到动作
   const candidates = [];
-  if (learned) candidates.push(learned);
-  [EP_SIGN_SECURED, EP_SIGN_ALT, EP_SIGN].forEach(function (p) {
+  if (learned && !/\/info|\/query|\/day\//i.test(learned)) candidates.push(learned);
+  [EP_SIGN_SECURED, EP_SIGN].forEach(function (p) {
     if (candidates.indexOf(p) < 0) candidates.push(p);
   });
 
   for (let i = 0; i < candidates.length; i++) {
     const res = await callApiRaw("POST", candidates[i], account.at, {}, learnedBody);
     const r = judge(res, candidates[i]);
+    console.log("[领克] 自建 " + candidates[i] + " -> " + res.status + " " + String(res.body || "").slice(0, 90));
     if (r.ok) return r;
     tried.push({ path: candidates[i], mode: "self", status: res.status, text: r.text });
     if (res.status === 403) continue; // 该接口未授权给当前 consumer, 换下一个
@@ -793,12 +799,20 @@ function diagSignature() {
   const storedCaKey = readStore(CA_KEY_STORE);
   if (storedCaKey) caKey = storedCaKey;
 
+  // 打印当前存储状态, 方便判断"到底有没有录到签到请求"
+  const dbgProbe = safeJson(readStore(PROBE_KEY) || "null");
+  console.log("[领克] 录制快照: " + (dbgProbe
+    ? (String(dbgProbe.method || "?").toUpperCase() + " " + String(dbgProbe.url || "").replace(/^https?:\/\/[^/]+/, "") +
+       " | 头 " + Object.keys(dbgProbe.headers || {}).length + " 个 | body " + (dbgProbe.body ? String(dbgProbe.body).length + " 字节" : "空"))
+    : "无"));
+
   // 有录制快照时, 先做一次签名有效性诊断
   try { diagSignature(); } catch (e) { console.log("[领克] 诊断失败: " + e); }
 
   // 从录制快照学习真实签到路径 + 请求体 (每次运行都刷新)
   try { learnSignPath(); } catch (e) { console.log("[领克] 学习路径失败: " + e); }
   try { learnSignBody(); } catch (e) { console.log("[领克] 学习请求体失败: " + e); }
+  console.log("[领克] 学习路径: " + (readStore(SIGN_PATH_STORE) || "无"));
 
   const list = safeJson(readStore(ACCOUNT_KEY) || "[]");
 
